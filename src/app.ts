@@ -9,31 +9,61 @@ import { typing } from "./utils/presence"
 const PORT = process.env.PORT ?? 3008
 /** ID del asistente de OpenAI */
 const ASSISTANT_ID = process.env.ASSISTANT_ID ?? ''
-const userQueues = new Map();
-const userLocks = new Map(); // New lock mechanism
 
-/**
- * Function to process the user's message by sending it to the OpenAI API
- * and sending the response back to the user.
- */
+// Stores user queues and locks
+const userQueues = new Map();
+const userLocks = new Map();
+const userMessageCounts = new Map(); // Stores message count for rate limiting
+const userBanList = new Map(); // Tracks banned users and ban expiration times
+
+/** Function to check if a user is banned */
+const isUserBanned = (userId) => {
+    const banExpiry = userBanList.get(userId);
+    if (!banExpiry) return false; // User is not banned
+    if (Date.now() > banExpiry) {
+        userBanList.delete(userId); // Ban expired, remove from ban list
+        return false;
+    }
+    return true; // User is still banned
+}
+
+/** Function to ban a user */
+const banUser = (userId, duration) => {
+    const banExpiry = Date.now() + duration;
+    userBanList.set(userId, banExpiry);
+}
+
+/** Function to check rate limits and apply bans */
+const rateLimitUser = (userId) => {
+    const currentCount = userMessageCounts.get(userId) ?? 0;
+    const newCount = currentCount + 1;
+    userMessageCounts.set(userId, newCount);
+
+    if (newCount > 30) {
+        return false; // Exceeds rate limit
+    }
+    return true; // Within rate limit
+}
+
+/** Function to process the user's message by sending it to the OpenAI API and sending the response back to the user. */
 const processUserMessage = async (ctx, { flowDynamic, state, provider }) => {
     await typing(ctx, provider);
     const response = await toAsk(ASSISTANT_ID, ctx.body, state);
 
-    // Split the response into chunks and send them sequentially
-    const chunks = response.split(/\n\n+/);
+    // Remove special characters and send response
+    const cleanedResponse = response.replace(/\[.*?\]|\*\*/g, "").replace(/\*\*/g, "*");
+    const chunks = cleanedResponse.split(/\n\n+/);
+
     for (const chunk of chunks) {
-        const cleanedChunk = chunk.trim().replace(/【.*?】[ ] /g, "");
+        const cleanedChunk = chunk.trim();
         await flowDynamic([{ body: cleanedChunk }]);
     }
-};
+}
 
-/**
- * Function to handle the queue for each user.
- */
+/** Function to handle the queue for each user. */
 const handleQueue = async (userId) => {
     const queue = userQueues.get(userId);
-    
+
     if (userLocks.get(userId)) {
         return; // If locked, skip processing
     }
@@ -52,15 +82,22 @@ const handleQueue = async (userId) => {
 
     userLocks.delete(userId); // Remove the lock once all messages are processed
     userQueues.delete(userId); // Remove the queue once all messages are processed
-};
+}
 
-/**
- * Flujo de bienvenida que maneja las respuestas del asistente de IA
- * @type {import('@builderbot/bot').Flow<BaileysProvider, MemoryDB>}
- */
+/** Flujo de bienvenida que maneja las respuestas del asistente de IA */
 const welcomeFlow = addKeyword<BaileysProvider, MemoryDB>(EVENTS.WELCOME)
     .addAction(async (ctx, { flowDynamic, state, provider }) => {
-        const userId = ctx.from; // Use the user's ID to create a unique queue for each user
+        const userId = ctx.from;
+
+        if (isUserBanned(userId)) {
+            return; // Ignore banned users
+        }
+
+        if (!rateLimitUser(userId)) {
+            banUser(userId, 60 * 60 * 1000); // Ban for 1 hour
+            await flowDynamic([{ body: "You have been temporarily banned for exceeding the message limit." }]);
+            return;
+        }
 
         if (!userQueues.has(userId)) {
             userQueues.set(userId, []);
@@ -75,37 +112,16 @@ const welcomeFlow = addKeyword<BaileysProvider, MemoryDB>(EVENTS.WELCOME)
         }
     });
 
-/**
- * Función principal que configura y inicia el bot
- * @async
- * @returns {Promise<void>}
- */
+/** Función principal que configura y inicia el bot */
 const main = async () => {
-    /**
-     * Flujo del bot
-     * @type {import('@builderbot/bot').Flow<BaileysProvider, MemoryDB>}
-     */
     const adapterFlow = createFlow([welcomeFlow]);
-
-    /**
-     * Proveedor de servicios de mensajería
-     * @type {BaileysProvider}
-     */
     const adapterProvider = createProvider(BaileysProvider, {
         groupsIgnore: true,
         readStatus: false,
     });
 
-    /**
-     * Base de datos en memoria para el bot
-     * @type {MemoryDB}
-     */
     const adapterDB = new MemoryDB();
 
-    /**
-     * Configuración y creación del bot
-     * @type {import('@builderbot/bot').Bot<BaileysProvider, MemoryDB>}
-     */
     const { httpServer } = await createBot({
         flow: adapterFlow,
         provider: adapterProvider,
@@ -114,6 +130,6 @@ const main = async () => {
 
     httpInject(adapterProvider.server);
     httpServer(+PORT);
-};
+}
 
 main();
