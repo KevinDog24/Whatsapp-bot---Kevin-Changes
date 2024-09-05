@@ -1,20 +1,42 @@
-import "dotenv/config"
-import { createBot, createProvider, createFlow, addKeyword, EVENTS } from '@builderbot/bot'
-import { MemoryDB } from '@builderbot/bot'
-import { BaileysProvider } from '@builderbot/provider-baileys'
-import { toAsk, httpInject } from "@builderbot-plugins/openai-assistants"
-import { typing } from "./utils/presence"
+import "dotenv/config";
+import { createBot, createProvider, createFlow, addKeyword, EVENTS } from '@builderbot/bot';
+import { MemoryDB } from '@builderbot/bot';
+import { BaileysProvider } from '@builderbot/provider-baileys';
+import { toAsk, httpInject } from "@builderbot-plugins/openai-assistants";
+import { typing } from "./utils/presence";
 
-/** Puerto en el que se ejecutará el servidor */
-const PORT = process.env.PORT ?? 3008
-/** ID del asistente de OpenAI */
-const ASSISTANT_ID = process.env.ASSISTANT_ID ?? ''
-
-// Stores user queues and locks
+const PORT = process.env.PORT ?? 3008;
+const ASSISTANT_ID = process.env.ASSISTANT_ID ?? '';
 const userQueues = new Map();
 const userLocks = new Map();
-const userMessageCounts = new Map(); // Stores message count for rate limiting
-const userBanList = new Map(); // Tracks banned users and ban expiration times
+const userMessageCount = new Map();
+const userBanList = new Map(); // Holds user bans with expiry times
+const MAX_MESSAGES_PER_DAY = 20;
+const BAN_DURATION = 24 * 60 * 60 * 1000; // 24 hours in milliseconds
+
+/** Function to rate-limit users */
+const rateLimitUser = (userId) => {
+    const currentTime = Date.now();
+    const userStats = userMessageCount.get(userId) || { count: 0, firstMessageTime: currentTime };
+
+    if (currentTime - userStats.firstMessageTime > 24 * 60 * 60 * 1000) {
+        // Reset the count if more than 24 hours have passed
+        userStats.count = 1;
+        userStats.firstMessageTime = currentTime;
+    } else {
+        userStats.count += 1;
+    }
+
+    userMessageCount.set(userId, userStats);
+
+    return userStats.count <= MAX_MESSAGES_PER_DAY;
+};
+
+/** Function to ban a user for a specified duration */
+const banUser = (userId, duration) => {
+    const banExpiry = Date.now() + duration;
+    userBanList.set(userId, banExpiry);
+};
 
 /** Function to check if a user is banned */
 const isUserBanned = (userId) => {
@@ -25,45 +47,28 @@ const isUserBanned = (userId) => {
         return false;
     }
     return true; // User is still banned
-}
+};
 
-/** Function to ban a user */
-const banUser = (userId, duration) => {
-    const banExpiry = Date.now() + duration;
-    userBanList.set(userId, banExpiry);
-}
-
-/** Function to check rate limits and apply bans */
-const rateLimitUser = (userId) => {
-    const currentCount = userMessageCounts.get(userId) ?? 0;
-    const newCount = currentCount + 1;
-    userMessageCounts.set(userId, newCount);
-
-    if (newCount > 30) {
-        return false; // Exceeds rate limit
-    }
-    return true; // Within rate limit
-}
-
-/** Function to process the user's message by sending it to the OpenAI API and sending the response back to the user. */
+/** Function to process the user's message by sending it to the OpenAI API and sending the response back to the user */
 const processUserMessage = async (ctx, { flowDynamic, state, provider }) => {
     await typing(ctx, provider);
     const response = await toAsk(ASSISTANT_ID, ctx.body, state);
 
-    // Remove special characters and send response
-    const cleanedResponse = response.replace(/\[.*?\]|\*\*/g, "").replace(/\*\*/g, "*");
-    const chunks = cleanedResponse.split(/\n\n+/);
+    // Split the response into chunks and send them sequentially
+    const cleanedResponse = response
+        .replace(/\[.*?\]/g, "") // Removes text inside brackets []
+        .replace(/\*\*(.*?)\*\*/g, "*$1*"); // Converts **text** to *text*
 
+    const chunks = cleanedResponse.split(/\n\n+/);
     for (const chunk of chunks) {
         const cleanedChunk = chunk.trim();
         await flowDynamic([{ body: cleanedChunk }]);
     }
-}
+};
 
-/** Function to handle the queue for each user. */
+/** Function to handle the queue for each user */
 const handleQueue = async (userId) => {
     const queue = userQueues.get(userId);
-
     if (userLocks.get(userId)) {
         return; // If locked, skip processing
     }
@@ -82,20 +87,20 @@ const handleQueue = async (userId) => {
 
     userLocks.delete(userId); // Remove the lock once all messages are processed
     userQueues.delete(userId); // Remove the queue once all messages are processed
-}
+};
 
 /** Flujo de bienvenida que maneja las respuestas del asistente de IA */
 const welcomeFlow = addKeyword<BaileysProvider, MemoryDB>(EVENTS.WELCOME)
     .addAction(async (ctx, { flowDynamic, state, provider }) => {
-        const userId = ctx.from;
+        const userId = ctx.from; // Use the user's ID to create a unique queue for each user
 
         if (isUserBanned(userId)) {
-            return; // Ignore banned users
+            return; // User is banned, don't process or queue the message
         }
 
         if (!rateLimitUser(userId)) {
-            banUser(userId, 60 * 60 * 1000); // Ban for 1 hour
-            await flowDynamic([{ body: "You have been temporarily banned for exceeding the message limit." }]);
+            banUser(userId, BAN_DURATION); // Ban for 24 hours
+            await flowDynamic([{ body: "Haz abusado del servicio, estas baneado por 24 horas." }]);
             return;
         }
 
@@ -115,6 +120,7 @@ const welcomeFlow = addKeyword<BaileysProvider, MemoryDB>(EVENTS.WELCOME)
 /** Función principal que configura y inicia el bot */
 const main = async () => {
     const adapterFlow = createFlow([welcomeFlow]);
+
     const adapterProvider = createProvider(BaileysProvider, {
         groupsIgnore: true,
         readStatus: false,
@@ -130,6 +136,6 @@ const main = async () => {
 
     httpInject(adapterProvider.server);
     httpServer(+PORT);
-}
+};
 
 main();
