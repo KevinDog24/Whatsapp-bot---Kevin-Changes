@@ -5,108 +5,76 @@ import { BaileysProvider } from '@builderbot/provider-baileys'
 import { toAsk, httpInject } from "@builderbot-plugins/openai-assistants"
 import { typing } from "./utils/presence"
 
+/** Puerto en el que se ejecutará el servidor */
 const PORT = process.env.PORT ?? 3008
+/** ID del asistente de OpenAI */
 const ASSISTANT_ID = process.env.ASSISTANT_ID ?? ''
-
-// Map para almacenar la cola de usuarios y los bloqueos
 const userQueues = new Map();
-const userLocks = new Map(); // Bloqueo de procesamiento por usuario
-const userBans = new Map(); // Almacena los usuarios temporalmente bloqueados
-const messageLimits = new Map(); // Almacena el contador de mensajes de cada usuario
-const MAX_MESSAGES = 20; // Límite de mensajes
-const BAN_DURATION = 24 * 60 * 60 * 1000; // Duración del bloqueo (24 horas)
+const userLocks = new Map(); // New lock mechanism
 
 /**
- * Función para verificar si un usuario está bloqueado
- */
-const isUserBanned = (userId) => {
-    const banEnd = userBans.get(userId);
-    if (banEnd && banEnd > Date.now()) {
-        return true; // Usuario está bloqueado
-    }
-    return false; // Usuario no está bloqueado
-};
-
-/**
- * Función para bloquear a un usuario por exceder el límite de mensajes
- */
-const banUser = (userId) => {
-    userBans.set(userId, Date.now() + BAN_DURATION); // Bloquear por 24 horas
-    messageLimits.delete(userId); // Resetear el conteo de mensajes
-};
-
-/**
- * Función para controlar el límite de mensajes
- */
-const rateLimitUser = (userId) => {
-    const messageCount = messageLimits.get(userId) || 0;
-    if (messageCount >= MAX_MESSAGES) {
-        return false; // El usuario excedió el límite de mensajes
-    }
-    messageLimits.set(userId, messageCount + 1); // Incrementar el conteo de mensajes
-    return true;
-};
-
-/**
- * Función para procesar el mensaje de usuario
+ * Function to process the user's message by sending it to the OpenAI API
+ * and sending the response back to the user, with text cleanup.
  */
 const processUserMessage = async (ctx, { flowDynamic, state, provider }) => {
     await typing(ctx, provider);
+
+    // Send the original input message to the OpenAI assistant
     const response = await toAsk(ASSISTANT_ID, ctx.body, state);
 
-    const chunks = response.split(/\n\n+/);
+    // Clean the response (remove content inside brackets and brackets themselves)
+    const cleanedResponse = response.replace(/\[.*?\]/g, "").trim();
+
+    // Split the response into chunks and send them sequentially
+    const chunks = cleanedResponse.split(/\n\n+/);
     for (const chunk of chunks) {
-        const cleanedChunk = chunk.trim().replace(/【.*?】[ ]/g, "").replace(/\*\*/g, "*");
+        const cleanedChunk = chunk.trim().replace(/【.*?】[ ] /g, "");
         await flowDynamic([{ body: cleanedChunk }]);
     }
 };
 
 /**
- * Función para manejar la cola de mensajes de un usuario
+ * Function to handle the queue for each user and continuously show typing indicator.
  */
-const handleQueue = async (userId) => {
+const handleQueue = async (userId, ctx, provider) => {
     const queue = userQueues.get(userId);
+
     if (userLocks.get(userId)) {
-        return; // Si el usuario está bloqueado, no procesar
+        return; // If locked, skip processing
     }
 
+    // Set an interval to show typing as long as the queue is processing
+    const typingInterval = setInterval(async () => {
+        await typing(ctx, provider);
+    }, 1000); // Sends "typing" every second
+
     while (queue.length > 0) {
-        userLocks.set(userId, true); // Bloquear procesamiento mientras se procesa el mensaje
+        userLocks.set(userId, true); // Lock the queue
         const { ctx, flowDynamic, state, provider } = queue.shift();
         try {
             await processUserMessage(ctx, { flowDynamic, state, provider });
         } catch (error) {
             console.error(`Error processing message for user ${userId}:`, error);
         } finally {
-            userLocks.set(userId, false); // Liberar el bloqueo
+            userLocks.set(userId, false); // Release the lock
         }
     }
 
-    userLocks.delete(userId); // Eliminar el bloqueo al terminar
-    userQueues.delete(userId); // Eliminar la cola una vez procesados todos los mensajes
+    // Clear the interval once the queue is empty
+    clearInterval(typingInterval);
+
+    userLocks.delete(userId); // Remove the lock once all messages are processed
+    userQueues.delete(userId); // Remove the queue once all messages are processed
 };
 
 /**
  * Flujo de bienvenida que maneja las respuestas del asistente de IA
+ * @type {import('@builderbot/bot').Flow<BaileysProvider, MemoryDB>}
  */
 const welcomeFlow = addKeyword<BaileysProvider, MemoryDB>(EVENTS.WELCOME)
     .addAction(async (ctx, { flowDynamic, state, provider }) => {
-        const userId = ctx.from;
+        const userId = ctx.from; // Use the user's ID to create a unique queue for each user
 
-        // Verificar si el usuario está bloqueado
-        if (isUserBanned(userId)) {
-            console.log(`User ${userId} is banned. Ignoring message.`);
-            return; // Ignorar mensajes si el usuario está bloqueado
-        }
-
-        // Verificar si excedió el límite de mensajes
-        if (!rateLimitUser(userId)) {
-            banUser(userId); // Bloquear por exceder el límite
-            await flowDynamic([{ body: "Has sido bloqueado temporalmente por exceder el límite de mensajes." }]);
-            return;
-        }
-
-        // Manejar la cola de mensajes
         if (!userQueues.has(userId)) {
             userQueues.set(userId, []);
         }
@@ -114,36 +82,43 @@ const welcomeFlow = addKeyword<BaileysProvider, MemoryDB>(EVENTS.WELCOME)
         const queue = userQueues.get(userId);
         queue.push({ ctx, flowDynamic, state, provider });
 
+        // If this is the only message in the queue, process it immediately
         if (!userLocks.get(userId) && queue.length === 1) {
-            await handleQueue(userId);
+            await handleQueue(userId, ctx, provider);
         }
     });
 
 /**
- * Función principal para configurar el bot
+ * Función principal que configura y inicia el bot
+ * @async
+ * @returns {Promise<void>}
  */
 const main = async () => {
+    /**
+     * Flujo del bot
+     * @type {import('@builderbot/bot').Flow<BaileysProvider, MemoryDB>}
+     */
     const adapterFlow = createFlow([welcomeFlow]);
 
+    /**
+     * Proveedor de servicios de mensajería
+     * @type {BaileysProvider}
+     */
     const adapterProvider = createProvider(BaileysProvider, {
         groupsIgnore: true,
         readStatus: false,
     });
 
+    /**
+     * Base de datos en memoria para el bot
+     * @type {MemoryDB}
+     */
     const adapterDB = new MemoryDB();
 
-    adapterProvider.on('connection.update', (update) => {
-        const { connection, lastDisconnect } = update;
-        if (connection === 'close') {
-            const shouldReconnect = (lastDisconnect?.error)?.output?.statusCode !== 401;
-            console.error('Connection closed. Reconnecting:', shouldReconnect, lastDisconnect?.error);
-        } else if (connection === 'open') {
-            console.log('✅ Connected to WhatsApp');
-        } else {
-            console.log('Connection update:', update);
-        }
-    });
-
+    /**
+     * Configuración y creación del bot
+     * @type {import('@builderbot/bot').Bot<BaileysProvider, MemoryDB>}
+     */
     const { httpServer } = await createBot({
         flow: adapterFlow,
         provider: adapterProvider,
