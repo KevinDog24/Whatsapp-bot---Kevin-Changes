@@ -5,47 +5,75 @@ import { BaileysProvider } from '@builderbot/provider-baileys'
 import { toAsk, httpInject } from "@builderbot-plugins/openai-assistants"
 import { typing } from "./utils/presence"
 
-/** Puerto en el que se ejecutará el servidor */
 const PORT = process.env.PORT ?? 3008
-/** ID del asistente de OpenAI */
 const ASSISTANT_ID = process.env.ASSISTANT_ID ?? ''
+
+// Map para almacenar la cola de usuarios y los bloqueos
 const userQueues = new Map();
-const userLocks = new Map(); // Mecanismo de bloqueo para cada usuario
+const userLocks = new Map(); // Bloqueo de procesamiento por usuario
+const userBans = new Map(); // Almacena los usuarios temporalmente bloqueados
+const messageLimits = new Map(); // Almacena el contador de mensajes de cada usuario
+const MAX_MESSAGES = 20; // Límite de mensajes
+const BAN_DURATION = 24 * 60 * 60 * 1000; // Duración del bloqueo (24 horas)
 
 /**
- * Function to process the user's message by sending it to the OpenAI API
- * and sending the response back to the user.
+ * Función para verificar si un usuario está bloqueado
+ */
+const isUserBanned = (userId) => {
+    const banEnd = userBans.get(userId);
+    if (banEnd && banEnd > Date.now()) {
+        return true; // Usuario está bloqueado
+    }
+    return false; // Usuario no está bloqueado
+};
+
+/**
+ * Función para bloquear a un usuario por exceder el límite de mensajes
+ */
+const banUser = (userId) => {
+    userBans.set(userId, Date.now() + BAN_DURATION); // Bloquear por 24 horas
+    messageLimits.delete(userId); // Resetear el conteo de mensajes
+};
+
+/**
+ * Función para controlar el límite de mensajes
+ */
+const rateLimitUser = (userId) => {
+    const messageCount = messageLimits.get(userId) || 0;
+    if (messageCount >= MAX_MESSAGES) {
+        return false; // El usuario excedió el límite de mensajes
+    }
+    messageLimits.set(userId, messageCount + 1); // Incrementar el conteo de mensajes
+    return true;
+};
+
+/**
+ * Función para procesar el mensaje de usuario
  */
 const processUserMessage = async (ctx, { flowDynamic, state, provider }) => {
-    await typing(ctx, provider); // Aparece como si estuviera escribiendo
+    await typing(ctx, provider);
     const response = await toAsk(ASSISTANT_ID, ctx.body, state);
 
-    // Dividir la respuesta en chunks y enviarlos secuencialmente
     const chunks = response.split(/\n\n+/);
     for (const chunk of chunks) {
-        const cleanedChunk = chunk.trim().replace(/【.*?】[ ] /g, "");
+        const cleanedChunk = chunk.trim().replace(/【.*?】[ ]/g, "").replace(/\*\*/g, "*");
         await flowDynamic([{ body: cleanedChunk }]);
     }
 };
 
 /**
- * Function to handle the queue for each user.
+ * Función para manejar la cola de mensajes de un usuario
  */
 const handleQueue = async (userId) => {
     const queue = userQueues.get(userId);
-    
     if (userLocks.get(userId)) {
-        console.log(`User ${userId} is locked. Skipping message processing.`);
-        return; // Si está bloqueado, no procesar
+        return; // Si el usuario está bloqueado, no procesar
     }
 
     while (queue.length > 0) {
-        userLocks.set(userId, true); // Bloquear el procesamiento para este usuario
+        userLocks.set(userId, true); // Bloquear procesamiento mientras se procesa el mensaje
         const { ctx, flowDynamic, state, provider } = queue.shift();
-        
         try {
-            // Aquí hacemos que siempre aparezca "escribiendo" mientras haya mensajes en la cola
-            await typing(ctx, provider); // Aparece como escribiendo cada vez que se procesa un mensaje
             await processUserMessage(ctx, { flowDynamic, state, provider });
         } catch (error) {
             console.error(`Error processing message for user ${userId}:`, error);
@@ -54,40 +82,56 @@ const handleQueue = async (userId) => {
         }
     }
 
-    userLocks.delete(userId); // Eliminar el bloqueo una vez procesados todos los mensajes
+    userLocks.delete(userId); // Eliminar el bloqueo al terminar
     userQueues.delete(userId); // Eliminar la cola una vez procesados todos los mensajes
 };
 
 /**
- * Función principal que configura y maneja los eventos de conexión/desconexión del proveedor de WhatsApp.
- * @async
- * @returns {Promise<void>}
+ * Flujo de bienvenida que maneja las respuestas del asistente de IA
+ */
+const welcomeFlow = addKeyword<BaileysProvider, MemoryDB>(EVENTS.WELCOME)
+    .addAction(async (ctx, { flowDynamic, state, provider }) => {
+        const userId = ctx.from;
+
+        // Verificar si el usuario está bloqueado
+        if (isUserBanned(userId)) {
+            console.log(`User ${userId} is banned. Ignoring message.`);
+            return; // Ignorar mensajes si el usuario está bloqueado
+        }
+
+        // Verificar si excedió el límite de mensajes
+        if (!rateLimitUser(userId)) {
+            banUser(userId); // Bloquear por exceder el límite
+            await flowDynamic([{ body: "Has sido bloqueado temporalmente por exceder el límite de mensajes." }]);
+            return;
+        }
+
+        // Manejar la cola de mensajes
+        if (!userQueues.has(userId)) {
+            userQueues.set(userId, []);
+        }
+
+        const queue = userQueues.get(userId);
+        queue.push({ ctx, flowDynamic, state, provider });
+
+        if (!userLocks.get(userId) && queue.length === 1) {
+            await handleQueue(userId);
+        }
+    });
+
+/**
+ * Función principal para configurar el bot
  */
 const main = async () => {
-    /**
-     * Flujo del bot
-     * @type {import('@builderbot/bot').Flow<BaileysProvider, MemoryDB>}
-     */
     const adapterFlow = createFlow([welcomeFlow]);
 
-    /**
-     * Proveedor de servicios de mensajería
-     * @type {BaileysProvider}
-     */
     const adapterProvider = createProvider(BaileysProvider, {
         groupsIgnore: true,
         readStatus: false,
     });
 
-    /**
-     * Base de datos en memoria para el bot
-     * @type {MemoryDB}
-     */
     const adapterDB = new MemoryDB();
 
-    /**
-     * Manejo de eventos de conexión/desconexión
-     */
     adapterProvider.on('connection.update', (update) => {
         const { connection, lastDisconnect } = update;
         if (connection === 'close') {
@@ -100,10 +144,6 @@ const main = async () => {
         }
     });
 
-    /**
-     * Configuración y creación del bot
-     * @type {import('@builderbot/bot').Bot<BaileysProvider, MemoryDB>}
-     */
     const { httpServer } = await createBot({
         flow: adapterFlow,
         provider: adapterProvider,
@@ -113,26 +153,5 @@ const main = async () => {
     httpInject(adapterProvider.server);
     httpServer(+PORT);
 };
-
-/**
- * Flujo de bienvenida que maneja las respuestas del asistente de IA
- * @type {import('@builderbot/bot').Flow<BaileysProvider, MemoryDB>}
- */
-const welcomeFlow = addKeyword<BaileysProvider, MemoryDB>(EVENTS.WELCOME)
-    .addAction(async (ctx, { flowDynamic, state, provider }) => {
-        const userId = ctx.from; // Usar el ID del usuario para crear una cola única
-
-        if (!userQueues.has(userId)) {
-            userQueues.set(userId, []);
-        }
-
-        const queue = userQueues.get(userId);
-        queue.push({ ctx, flowDynamic, state, provider });
-
-        // Si este es el único mensaje en la cola, procesarlo inmediatamente
-        if (!userLocks.get(userId) && queue.length === 1) {
-            await handleQueue(userId);
-        }
-    });
 
 main();
