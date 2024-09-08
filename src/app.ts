@@ -1,3 +1,4 @@
+// Import required dependencies and configurations
 import "dotenv/config"
 import { createBot, createProvider, createFlow, addKeyword, EVENTS } from '@builderbot/bot'
 import { MemoryDB } from '@builderbot/bot'
@@ -5,160 +6,321 @@ import { BaileysProvider } from '@builderbot/provider-baileys'
 import { toAsk, httpInject } from "@builderbot-plugins/openai-assistants"
 import { typing } from "./utils/presence"
 
+// Define constant values
 const PORT = process.env.PORT ?? 3008
 const ASSISTANT_ID = process.env.ASSISTANT_ID ?? ''
 
-// Map para almacenar la cola de usuarios y los bloqueos
-const userQueues = new Map();
-const userLocks = new Map(); // Bloqueo de procesamiento por usuario
-const userBans = new Map(); // Almacena los usuarios temporalmente bloqueados
-const messageLimits = new Map(); // Almacena el contador de mensajes de cada usuario
-const MAX_MESSAGES = 20; // Límite de mensajes
-const BAN_DURATION = 24 * 60 * 60 * 1000; // Duración del bloqueo (24 horas)
+// Define interfaces for type safety
+interface UserMessageInfo {
+    count: number;
+    firstMessageTime: number;
+    queue: any[];
+    processing: boolean;
+}
 
-/**
- * Función para verificar si un usuario está bloqueado
- */
-const isUserBanned = (userId) => {
-    const banEnd = userBans.get(userId);
-    if (banEnd && banEnd > Date.now()) {
-        return true; // Usuario está bloqueado
+interface RateLimitResult {
+    allowed: boolean;
+    count: number;
+    timeUntilReset: number;
+}
+
+// Custom LRU Cache implementation to track recent usage and automatically evict the least recently used entries.
+class SimpleLRUCache<K, V> {
+    private cache: Map<K, V>;
+    private capacity: number;
+
+    constructor(capacity: number) {
+        this.cache = new Map();
+        this.capacity = capacity;
     }
-    return false; // Usuario no está bloqueado
-};
 
-/**
- * Función para bloquear a un usuario por exceder el límite de mensajes
- */
-const banUser = (userId) => {
-    userBans.set(userId, Date.now() + BAN_DURATION); // Bloquear por 24 horas
-    messageLimits.delete(userId); // Resetear el conteo de mensajes
-};
-
-/**
- * Función para controlar el límite de mensajes
- */
-const rateLimitUser = (userId) => {
-    const messageCount = messageLimits.get(userId) || 0;
-    if (messageCount >= MAX_MESSAGES) {
-        return false; // El usuario excedió el límite de mensajes
+    /**
+     * Get a value from the cache and mark it as recently used
+     * @param key - The key to get from the cache
+     * @returns The cached value or undefined if not found
+     */
+    get(key: K): V | undefined {
+        if (!this.cache.has(key)) {
+            return undefined;
+        }
+        const value = this.cache.get(key)!;
+        this.cache.delete(key); // Remove the old entry
+        this.cache.set(key, value); // Reinsert to mark it as recently used
+        return value;
     }
-    messageLimits.set(userId, messageCount + 1); // Incrementar el conteo de mensajes
-    return true;
-};
+
+    /**
+     * Add a value to the cache
+     * If the cache exceeds the capacity, remove the least recently used item
+     * @param key - The key to add or update
+     * @param value - The value to cache
+     */
+    set(key: K, value: V): void {
+        if (this.cache.has(key)) {
+            this.cache.delete(key); // Remove the old entry if it exists
+        } else if (this.cache.size >= this.capacity) {
+            // Remove the least recently used (first) entry
+            const firstKey = this.cache.keys().next().value;
+            this.cache.delete(firstKey);
+        }
+        this.cache.set(key, value); // Add the new entry
+    }
+
+    /**
+     * Check if the cache contains a key
+     * @param key - The key to check
+     * @returns True if the cache contains the key, false otherwise
+     */
+    has(key: K): boolean {
+        return this.cache.has(key);
+    }
+
+    /**
+     * Clear the cache
+     */
+    clear(): void {
+        this.cache.clear();
+    }
+}
+
+// Initialize the user message information cache with a limit of 1000 users
+const userMessageInfo = new SimpleLRUCache<string, UserMessageInfo>(1000);
+
+// Define rate limiting constants
+const MAX_MESSAGES = 20;
+const RESET_PERIOD = 24 * 60 * 60 * 1000; // 24 hours in milliseconds
+const NOTIFICATION_THRESHOLD = 15;
 
 /**
- * Función para procesar el mensaje de usuario
+ * Applies rate limiting to user messages.
+ * 
+ * - This function tracks how many messages a specific user has sent within the
+ *   current 24-hour period. If the user exceeds the limit of MAX_MESSAGES, they
+ *   are prevented from sending more messages until the reset period (24 hours) elapses.
+ * - It stores user-specific data (message count and first message timestamp) 
+ *   in a cache (userMessageInfo).
+ * 
+ * @param userId - The unique identifier of the user (typically their WhatsApp number)
+ * @returns An object that includes whether the user is allowed to send messages,
+ *          how many messages they have sent, and how much time remains before 
+ *          the limit resets.
+ */
+const rateLimitUser = (userId: string): RateLimitResult => {
+    const now = Date.now();
+    let userInfo = userMessageInfo.get(userId);
+
+    // If user info is not present or their reset period has passed, initialize/reset their data
+    if (!userInfo || (now - userInfo.firstMessageTime) >= RESET_PERIOD) {
+        userInfo = { count: 0, firstMessageTime: now, queue: [], processing: false };
+    }
+
+    // Calculate remaining time until the user's message limit resets
+    const timeUntilReset = RESET_PERIOD - (now - userInfo.firstMessageTime);
+
+    // If the user has sent more than MAX_MESSAGES, deny message sending
+    if (userInfo.count >= MAX_MESSAGES) {
+        console.log(`Haz alcanzado el limite: ${userId} haz enviado ${userInfo.count} mensajes en las ultimas 24 horas.`);
+        return { allowed: false, count: userInfo.count, timeUntilReset };
+    }
+
+    // Otherwise, increment their message count and update the cache
+    userInfo.count++;
+    userMessageInfo.set(userId, userInfo);
+
+    return { allowed: true, count: userInfo.count, timeUntilReset };
+}
+
+/**
+ * Formats the remaining time until rate limit reset
+ * - Converts the remaining time from milliseconds into a human-readable format
+ *   (hours).
+ * 
+ * @param milliseconds - Time in milliseconds
+ * @returns Formatted time string
+ */
+const formatTimeRemaining = (milliseconds: number): string => {
+    const hours = Math.floor(milliseconds / (1000 * 60 * 60));
+    return `${hours} hora${hours !== 1 ? 's' : ''}`;
+}
+
+/**
+ * Returns the notification message for approaching rate limit
+ * - This function generates a message that warns the user when they have
+ *   reached the threshold of message usage (NOTIFICATION_THRESHOLD).
+ * 
+ * @returns Notification message string
+ */
+const getNotificationMessage = (): string => {
+    return `Debido a que es un servicio gratuito actualmente tenemos un limite de ${MAX_MESSAGES} mensajes por cada 24-horas. Haz usado ${NOTIFICATION_THRESHOLD} mensajes, te quedan 5 interacciones en este periodo.`;
+}
+
+/**
+ * Returns the message for when rate limit is reached
+ * - This function generates a message for when the user has reached their
+ *   daily message limit and provides the time until the reset.
+ * 
+ * @param timeUntilReset - Time until rate limit resets
+ * @returns Rate limit reached message string
+ */
+const getLimitReachedMessage = (timeUntilReset: number): string => {
+    const formattedTime = formatTimeRemaining(timeUntilReset);
+    return `Haz alcanzado el limite de mensajes. Por favor regresa en ${formattedTime} para continuar ayudandote. Esperamos verte pronto!`;
+}
+
+/**
+ * Processes a user message by sending it to the AI assistant and returning the response
+ * 
+ * - This function sends the user's message to the AI assistant using the `toAsk` function.
+ * - The response from the AI assistant is split into chunks to be sent back to the user 
+ *   in a more readable format.
+ * - Any error encountered during the message processing is caught and handled gracefully.
+ * 
+ * @param ctx - The context object containing message details
+ * @param flowDynamic - Function to send dynamic responses
+ * @param state - The current state object
+ * @param provider - The message provider
  */
 const processUserMessage = async (ctx, { flowDynamic, state, provider }) => {
-    await typing(ctx, provider); // Inicia el estado de "escribiendo"
-    const response = await toAsk(ASSISTANT_ID, ctx.body, state);
+    try {
+        // Simulate typing indicator to improve user experience
+        await typing(ctx, provider);
 
-    const chunks = response.split(/\n\n+/);
-    for (const chunk of chunks) {
-        // Limpiar el texto, reemplazando los asteriscos dobles por uno solo
-        const cleanedChunk = chunk.trim().replace(/【.*?】[ ]/g, "").replace(/\*\*/g, "*");
-        await flowDynamic([{ body: cleanedChunk }]);
+        // Send the message to the AI assistant and get the response
+        const response = await toAsk(ASSISTANT_ID, ctx.body, state);
+
+        // Split response into chunks to avoid long message blocks
+        const chunks = response.split(/\n\n+/);
+        for (const chunk of chunks) {
+            const cleanedChunk = chunk.trim().replace(/【.*?】/g, "").replace(/\*\*/g, "*");
+            await flowDynamic([{ body: cleanedChunk }]);
+        }
+
+        console.log(`Message processed successfully for user ${ctx.from}`);
+    } catch (error) {
+        console.error(`Error processing message for user ${ctx.from}:`, error);
+        await flowDynamic([{ body: "Una disculpa, ocurrio un error mientras procesaba tu mensaje. Por favor intentalo nuevamente." }]);
     }
 };
 
 /**
- * Función para manejar la cola de mensajes de un usuario
+ * Handles the message queue for a user
+ * 
+ * - This function ensures that messages for a user are processed in order.
+ * - If a message is already being processed, further messages are queued.
+ * - Typing indicators are simulated periodically while processing.
+ * 
+ * @param userId - The unique identifier for the user
+ * @param ctx - The context object containing message details
+ * @param provider - The message provider
  */
 const handleQueue = async (userId, ctx, provider) => {
-    const queue = userQueues.get(userId);
-    if (userLocks.get(userId)) {
-        return; // Si el usuario está bloqueado, no procesar
+    const queue = userMessageInfo.get(userId)?.queue || [];
+    if (userMessageInfo.get(userId)?.processing) {
+        return;
     }
 
-    // Mantener el estado de "escribiendo" mientras haya mensajes en la cola
     const typingInterval = setInterval(async () => {
         await typing(ctx, provider);
-    }, 1000); // Enviar "escribiendo" cada segundo
+    }, 1000);
 
     while (queue.length > 0) {
-        userLocks.set(userId, true); // Bloquear procesamiento mientras se procesa el mensaje
+        userMessageInfo.get(userId).processing = true;
         const { ctx, flowDynamic, state, provider } = queue.shift();
         try {
             await processUserMessage(ctx, { flowDynamic, state, provider });
         } catch (error) {
             console.error(`Error processing message for user ${userId}:`, error);
+            await flowDynamic([{ body: "Una disculpa, ocurrio un error mientras procesaba tu mensaje. Por favor intentalo nuevamente." }]);
         } finally {
-            userLocks.set(userId, false); // Liberar el bloqueo
+            userMessageInfo.get(userId).processing = false;
         }
     }
 
-    clearInterval(typingInterval); // Detener el estado de "escribiendo" cuando la cola esté vacía
-    userLocks.delete(userId); // Eliminar el bloqueo al terminar
-    userQueues.delete(userId); // Eliminar la cola una vez procesados todos los mensajes
+    clearInterval(typingInterval);
+    userMessageInfo.get(userId).queue = [];
 };
 
-/**
- * Flujo de bienvenida que maneja las respuestas del asistente de IA
- */
+// Define the welcome flow for the chatbot
 const welcomeFlow = addKeyword<BaileysProvider, MemoryDB>(EVENTS.WELCOME)
     .addAction(async (ctx, { flowDynamic, state, provider }) => {
         const userId = ctx.from;
 
-        // Verificar si el usuario está bloqueado
-        if (isUserBanned(userId)) {
-            console.log(`User ${userId} is banned. Ignoring message.`);
-            return; // Ignorar mensajes si el usuario está bloqueado
-        }
+        try {
+            // Apply rate limiting to the user
+            const rateLimitResult = rateLimitUser(userId);
 
-        // Verificar si excedió el límite de mensajes
-        if (!rateLimitUser(userId)) {
-            banUser(userId); // Bloquear por exceder el límite
-            await flowDynamic([{ body: "Has sido bloqueado temporalmente por exceder el límite de mensajes." }]);
-            return;
-        }
+            // If user exceeds the rate limit, notify them
+            if (!rateLimitResult.allowed) {
+                await flowDynamic([{ body: getLimitReachedMessage(rateLimitResult.timeUntilReset) }]);
+                return;
+            }
 
-        // Manejar la cola de mensajes
-        if (!userQueues.has(userId)) {
-            userQueues.set(userId, []);
-        }
+            // Notify user if they are close to the rate limit threshold
+            if (rateLimitResult.count === NOTIFICATION_THRESHOLD) {
+                await flowDynamic([{ body: getNotificationMessage() }]);
+            }
 
-        const queue = userQueues.get(userId);
-        queue.push({ ctx, flowDynamic, state, provider });
+            // Initialize or update user information
+            if (!userMessageInfo.has(userId)) {
+                userMessageInfo.set(userId, { count: rateLimitResult.count, firstMessageTime: Date.now(), queue: [], processing: false });
+            }
 
-        if (!userLocks.get(userId) && queue.length === 1) {
-            await handleQueue(userId, ctx, provider); // Agregado parámetro ctx y provider para el typing
+            const userInfo = userMessageInfo.get(userId);
+            userInfo.queue.push({ ctx, flowDynamic, state, provider });
+
+            // Process the queue if it's not already being processed
+            if (!userInfo.processing && userInfo.queue.length === 1) {
+                await handleQueue(userId, ctx, provider);
+            }
+        } catch (error) {
+            console.error(`Error in welcome flow for user ${userId}:`, error);
+            await flowDynamic([{ body: "Una disculpa, ocurrio un error mientras procesaba tu mensaje. Por favor intentalo nuevamente." }]);
         }
     });
 
 /**
- * Función principal para configurar el bot
+ * Main function to set up and run the chatbot
  */
 const main = async () => {
-    const adapterFlow = createFlow([welcomeFlow]);
+    try {
+        // Create flow, provider, and database adapters
+        const adapterFlow = createFlow([welcomeFlow]);
+        const adapterProvider = createProvider(BaileysProvider, {
+            groupsIgnore: true,
+            readStatus: false,
+        });
+        const adapterDB = new MemoryDB();
 
-    const adapterProvider = createProvider(BaileysProvider, {
-        groupsIgnore: true,
-        readStatus: false,
-    });
+        // Set up connection event listener
+        adapterProvider.on('connection.update', (update) => {
+            const { connection, lastDisconnect } = update;
+            if (connection === 'close') {
+                const shouldReconnect = (lastDisconnect?.error)?.output?.statusCode !== 401;
+                console.error('Connection closed. Reconnecting:', shouldReconnect, 'Error:', lastDisconnect?.error);
+            } else if (connection === 'open') {
+                console.log('✅ Connected to WhatsApp');
+            } else {
+                console.log('Connection update:', update);
+            }
+        });
 
-    const adapterDB = new MemoryDB();
+        // Create and start the bot
+        const { httpServer } = await createBot({
+            flow: adapterFlow,
+            provider: adapterProvider,
+            database: adapterDB,
+        });
 
-    adapterProvider.on('connection.update', (update) => {
-        const { connection, lastDisconnect } = update;
-        if (connection === 'close') {
-            const shouldReconnect = (lastDisconnect?.error)?.output?.statusCode !== 401;
-            console.error('Connection closed. Reconnecting:', shouldReconnect, lastDisconnect?.error);
-        } else if (connection === 'open') {
-            console.log('✅ Connected to WhatsApp');
-        } else {
-            console.log('Connection update:', update);
-        }
-    });
+        // Inject HTTP server and start listening on the specified port
+        httpInject(adapterProvider.server);
+        httpServer(+PORT);
 
-    const { httpServer } = await createBot({
-        flow: adapterFlow,
-        provider: adapterProvider,
-        database: adapterDB,
-    });
-
-    httpInject(adapterProvider.server);
-    httpServer(+PORT);
+        console.log(`Bot started and listening on port ${PORT}`);
+    } catch (error) {
+        console.error('Failed to start the bot:', error);
+        process.exit(1);
+    }
 };
 
+// Run the main function
 main();
