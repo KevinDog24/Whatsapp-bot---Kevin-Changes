@@ -119,6 +119,7 @@ const rateLimitUser = (userId: string): RateLimitResult => {
             processing: false, 
             bannedNotified: false // Initialize bannedNotified
         };
+        userMessageInfo.set(userId, userInfo); // Set userInfo in cache
         console.log(`User ${userId} has been unbanned.`);
     }
 
@@ -128,15 +129,16 @@ const rateLimitUser = (userId: string): RateLimitResult => {
         if (!userInfo.bannedNotified) {
             console.log(`User ${userId} is banned. Time until reset: ${timeUntilReset} ms`);
             userInfo.bannedNotified = true; // Notify the user only once
-            userMessageInfo.set(userId, userInfo);
+            userMessageInfo.set(userId, userInfo); // Update userInfo in cache
             return { allowed: false, count: userInfo.count, timeUntilReset };
         }
         return { allowed: false, count: userInfo.count, timeUntilReset };
     }
 
+    // Increment message count and reset bannedNotified flag if user is within limits
     userInfo.count++;
-    userInfo.bannedNotified = false; // Reset the notification flag when the user sends messages
-    userMessageInfo.set(userId, userInfo);
+    userInfo.bannedNotified = false; // Reset the notification flag
+    userMessageInfo.set(userId, userInfo); // Update userInfo in cache
 
     console.log(`User ${userId} message count: ${userInfo.count}`);
     return { allowed: true, count: userInfo.count, timeUntilReset };
@@ -194,21 +196,22 @@ const getLimitReachedMessage = (timeUntilReset: number): string => {
  */
 const processUserMessage = async (ctx, { flowDynamic, state, provider }) => {
     try {
-        // Simulate typing indicator to improve user experience
         await typing(ctx, provider);
 
-        // Send the message to the AI assistant and get the response
         const response = await toAsk(ASSISTANT_ID, ctx.body, state);
 
-        // Split response into chunks to avoid long message blocks
+        if (!response) {
+            throw new Error("Ups, parece que el servicio de nuestra IA no esta disponible, lo estamos revisando.");
+        }
+
         const chunks = response.split(/\n\n+/);
         for (const chunk of chunks) {
             const cleanedChunk = chunk
                 .trim()
-                .replace(/【.*?】/g, "") // Remove 【text】 format
-                .replace(/\*\*/g, "*") // Replace double asterisks with single ones
-                .replace(/\n-\s/g, "\n"); // Replace a hyphen after a line break
-        
+                .replace(/【.*?】/g, "")
+                .replace(/\*\*/g, "*")
+                .replace(/\n-\s/g, "\n");
+            
             await flowDynamic([{ body: cleanedChunk }]);
         }
 
@@ -231,8 +234,9 @@ const processUserMessage = async (ctx, { flowDynamic, state, provider }) => {
  * @param provider - The message provider
  */
 const handleQueue = async (userId, ctx, provider) => {
-    const queue = userMessageInfo.get(userId)?.queue || [];
-    if (userMessageInfo.get(userId)?.processing) {
+    const userInfo = userMessageInfo.get(userId);
+    const queue = userInfo?.queue || [];
+    if (userInfo?.processing) {
         return;
     }
 
@@ -241,7 +245,7 @@ const handleQueue = async (userId, ctx, provider) => {
     }, 1000);
 
     while (queue.length > 0) {
-        userMessageInfo.get(userId).processing = true;
+        userInfo.processing = true;
         const { ctx, flowDynamic, state, provider } = queue.shift();
         try {
             await processUserMessage(ctx, { flowDynamic, state, provider });
@@ -249,12 +253,13 @@ const handleQueue = async (userId, ctx, provider) => {
             console.error(`Error processing message for user ${userId}:`, error);
             await flowDynamic([{ body: "Una disculpa, ocurrio un error mientras procesaba tu mensaje. Por favor intentalo nuevamente." }]);
         } finally {
-            userMessageInfo.get(userId).processing = false;
+            userInfo.processing = false;
         }
     }
 
     clearInterval(typingInterval);
-    userMessageInfo.get(userId).queue = [];
+    userInfo.queue = []; // Ensure this is done after processing
+    userMessageInfo.set(userId, userInfo); // Save the updated userInfo back into the cache
 };
 
 // Define the welcome flow for the chatbot
@@ -279,8 +284,15 @@ const welcomeFlow = addKeyword<BaileysProvider, MemoryDB>(EVENTS.WELCOME)
 
             // Initialize or update user information
             if (!userMessageInfo.has(userId)) {
-                userMessageInfo.set(userId, { count: rateLimitResult.count, firstMessageTime: Date.now(), queue: [], processing: false });
+                userMessageInfo.set(userId, { 
+                    count: rateLimitResult.count, 
+                    firstMessageTime: Date.now(), 
+                    queue: [], 
+                    processing: false, 
+                    bannedNotified: false
+                });
             }
+            
 
             const userInfo = userMessageInfo.get(userId);
             userInfo.queue.push({ ctx, flowDynamic, state, provider });
