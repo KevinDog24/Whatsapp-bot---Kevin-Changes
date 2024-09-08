@@ -110,8 +110,15 @@ const rateLimitUser = (userId: string): RateLimitResult => {
     const now = Date.now();
     let userInfo = userMessageInfo.get(userId);
 
+    // If user info is not present or their reset period has passed, initialize/reset their data
     if (!userInfo || (now - userInfo.firstMessageTime) >= RESET_PERIOD) {
-        userInfo = { count: 0, firstMessageTime: now, queue: [], processing: false, bannedNotified: false };
+        userInfo = { 
+            count: 0, 
+            firstMessageTime: now, 
+            queue: [], 
+            processing: false, 
+            bannedNotified: false // Initialize bannedNotified
+        };
         console.log(`User ${userId} has been unbanned.`);
     }
 
