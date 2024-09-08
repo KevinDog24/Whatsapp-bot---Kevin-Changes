@@ -84,8 +84,8 @@ class SimpleLRUCache<K, V> {
     }
 }
 
-// Initialize the user message information cache with a limit of 1000 users
-const userMessageInfo = new SimpleLRUCache<string, UserMessageInfo>(1000);
+// Initialize the user message information cache with a limit of 50 users
+const userMessageInfo = new SimpleLRUCache<string, UserMessageInfo>(50);
 
 // Define rate limiting constants
 const MAX_MESSAGES = 20;
@@ -119,30 +119,34 @@ const rateLimitUser = (userId: string): RateLimitResult => {
             processing: false, 
             bannedNotified: false // Initialize bannedNotified
         };
-        userMessageInfo.set(userId, userInfo); // Set userInfo in cache
+        userMessageInfo.set(userId, userInfo);
         console.log(`User ${userId} has been unbanned.`);
     }
 
     const timeUntilReset = RESET_PERIOD - (now - userInfo.firstMessageTime);
 
+    // Check if the user has reached the message limit
     if (userInfo.count >= MAX_MESSAGES) {
+        // Notify the user only if they haven't been notified already
         if (!userInfo.bannedNotified) {
             console.log(`User ${userId} is banned. Time until reset: ${timeUntilReset} ms`);
-            userInfo.bannedNotified = true; // Notify the user only once
-            userMessageInfo.set(userId, userInfo); // Update userInfo in cache
+            userInfo.bannedNotified = true; // Mark as notified
+            userMessageInfo.set(userId, userInfo); // Update cache
             return { allowed: false, count: userInfo.count, timeUntilReset };
         }
+        
+        // If the user has already been notified, do not respond further
         return { allowed: false, count: userInfo.count, timeUntilReset };
     }
 
     // Increment message count and reset bannedNotified flag if user is within limits
     userInfo.count++;
     userInfo.bannedNotified = false; // Reset the notification flag
-    userMessageInfo.set(userId, userInfo); // Update userInfo in cache
+    userMessageInfo.set(userId, userInfo);
 
     console.log(`User ${userId} message count: ${userInfo.count}`);
     return { allowed: true, count: userInfo.count, timeUntilReset };
-}
+};
 
 /**
  * Formats the remaining time until rate limit reset
@@ -208,12 +212,13 @@ const processUserMessage = async (ctx, { flowDynamic, state, provider }) => {
         for (const chunk of chunks) {
             const cleanedChunk = chunk
                 .trim()
-                .replace(/【.*?】/g, "")
-                .replace(/\*\*/g, "*")
-                .replace(/\n-\s/g, "\n");
+                .replace(/【.*?】/g, "")   // Remove special characters like 【】
+                .replace(/\*\*/g, "*")    // Replace double asterisks
+                .replace(/\n\s*-\s*/g, "\n");  // Remove line breaks followed by any number of spaces and a hyphen
             
             await flowDynamic([{ body: cleanedChunk }]);
         }
+        
 
         console.log(`Message processed successfully for user ${ctx.from}`);
     } catch (error) {
@@ -271,9 +276,13 @@ const welcomeFlow = addKeyword<BaileysProvider, MemoryDB>(EVENTS.WELCOME)
             // Apply rate limiting to the user
             const rateLimitResult = rateLimitUser(userId);
 
-            // If user exceeds the rate limit, notify them
+            // If the user exceeds the rate limit and has already been notified, stop processing
             if (!rateLimitResult.allowed) {
-                await flowDynamic([{ body: getLimitReachedMessage(rateLimitResult.timeUntilReset) }]);
+                // Only send the "limit reached" message if they haven't been notified yet
+                if (!userMessageInfo.get(userId)?.bannedNotified) {
+                    await flowDynamic([{ body: getLimitReachedMessage(rateLimitResult.timeUntilReset) }]);
+                }
+                // Don't process further messages for banned users
                 return;
             }
 
@@ -289,10 +298,9 @@ const welcomeFlow = addKeyword<BaileysProvider, MemoryDB>(EVENTS.WELCOME)
                     firstMessageTime: Date.now(), 
                     queue: [], 
                     processing: false, 
-                    bannedNotified: false
+                    bannedNotified: false 
                 });
             }
-            
 
             const userInfo = userMessageInfo.get(userId);
             userInfo.queue.push({ ctx, flowDynamic, state, provider });
@@ -323,16 +331,22 @@ const main = async () => {
         // Set up connection event listener
         adapterProvider.on('connection.update', (update) => {
             const { connection, lastDisconnect } = update;
+        
             if (connection === 'close') {
                 const shouldReconnect = (lastDisconnect?.error)?.output?.statusCode !== 401;
                 console.error('Connection closed. Reconnecting:', shouldReconnect, 'Error:', lastDisconnect?.error);
+        
+                // Custom reconnection logic for token expiry
+                if (lastDisconnect?.error?.output?.statusCode === 403) {
+                    console.error("Session expired, refreshing credentials...");
+                }
             } else if (connection === 'open') {
                 console.log('✅ Connected to WhatsApp');
             } else {
                 console.log('Connection update:', update);
             }
         });
-
+        
         // Create and start the bot
         const { httpServer } = await createBot({
             flow: adapterFlow,
