@@ -16,6 +16,7 @@ interface UserMessageInfo {
     firstMessageTime: number;
     queue: any[];
     processing: boolean;
+    bannedNotified: boolean; // New flag to track if the user was notified
 }
 
 interface RateLimitResult {
@@ -109,24 +110,28 @@ const rateLimitUser = (userId: string): RateLimitResult => {
     const now = Date.now();
     let userInfo = userMessageInfo.get(userId);
 
-    // If user info is not present or their reset period has passed, initialize/reset their data
     if (!userInfo || (now - userInfo.firstMessageTime) >= RESET_PERIOD) {
-        userInfo = { count: 0, firstMessageTime: now, queue: [], processing: false };
+        userInfo = { count: 0, firstMessageTime: now, queue: [], processing: false, bannedNotified: false };
+        console.log(`User ${userId} has been unbanned.`);
     }
 
-    // Calculate remaining time until the user's message limit resets
     const timeUntilReset = RESET_PERIOD - (now - userInfo.firstMessageTime);
 
-    // If the user has sent more than MAX_MESSAGES, deny message sending
     if (userInfo.count >= MAX_MESSAGES) {
-        console.log(`Haz alcanzado el limite: ${userId} haz enviado ${userInfo.count} mensajes en las ultimas 24 horas.`);
+        if (!userInfo.bannedNotified) {
+            console.log(`User ${userId} is banned. Time until reset: ${timeUntilReset} ms`);
+            userInfo.bannedNotified = true; // Notify the user only once
+            userMessageInfo.set(userId, userInfo);
+            return { allowed: false, count: userInfo.count, timeUntilReset };
+        }
         return { allowed: false, count: userInfo.count, timeUntilReset };
     }
 
-    // Otherwise, increment their message count and update the cache
     userInfo.count++;
+    userInfo.bannedNotified = false; // Reset the notification flag when the user sends messages
     userMessageInfo.set(userId, userInfo);
 
+    console.log(`User ${userId} message count: ${userInfo.count}`);
     return { allowed: true, count: userInfo.count, timeUntilReset };
 }
 
@@ -191,7 +196,12 @@ const processUserMessage = async (ctx, { flowDynamic, state, provider }) => {
         // Split response into chunks to avoid long message blocks
         const chunks = response.split(/\n\n+/);
         for (const chunk of chunks) {
-            const cleanedChunk = chunk.trim().replace(/【.*?】/g, "").replace(/\*\*/g, "*");
+            const cleanedChunk = chunk
+                .trim()
+                .replace(/【.*?】/g, "") // Remove 【text】 format
+                .replace(/\*\*/g, "*") // Replace double asterisks with single ones
+                .replace(/\n-\s/g, "\n"); // Replace a hyphen after a line break
+        
             await flowDynamic([{ body: cleanedChunk }]);
         }
 
