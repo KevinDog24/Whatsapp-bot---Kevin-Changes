@@ -10,6 +10,17 @@ import { typing } from "./utils/presence"
 const PORT = Number(process.env.PORT || 8080)
 const ASSISTANT_ID = process.env.ASSISTANT_ID ?? ''
 
+let connStatus: 'init' | 'connecting' | 'open' | 'close' = 'init'
+function explainErr(e: any) {
+  try {
+    if (e?.output?.payload?.message) return e.output.payload.message
+    if (e?.message) return e.message
+    return JSON.stringify(e)
+  } catch {
+    return String(e)
+  }
+}
+
 // Define interfaces for type safety
 interface UserMessageInfo {
     count: number;
@@ -334,7 +345,7 @@ const main = async () => {
         
             if (connection === 'close') {
                 const shouldReconnect = (lastDisconnect?.error)?.output?.statusCode !== 401;
-                console.error('Connection closed. Reconnecting:', shouldReconnect, 'Error:', lastDisconnect?.error);
+                console.error('Connection closed. Reconnecting:', shouldReconnect, 'Error:', explainErr(lastDisconnect?.error)
         
                 // Custom reconnection logic for token expiry
                 if (lastDisconnect?.error?.output?.statusCode === 403) {
@@ -356,12 +367,20 @@ const main = async () => {
 
         // Inject HTTP server and start listening on the specified port
         httpInject(adapterProvider.server);
-        httpServer(+PORT);
+        httpServer(+PORT);     // this already matches the new PORT above
+        console.log(`Bot started and listening on port ${PORT}`);
+
+        // Tiny health endpoints so Railway always gets a 200
+        adapterProvider.server?.get?.('/', (_req: any, res: any) => res.end('OK'))
+        
+        adapterProvider.server?.get?.('/status', (_req: any, res: any) => {
+          res.setHeader?.('Content-Type', 'application/json')
+          res.end(JSON.stringify({ status: connStatus }))
+        })
 
         console.log(`Bot started and listening on port ${PORT}`);
     } catch (error) {
         console.error('Failed to start the bot:', error);
-        process.exit(1);
     }
 };
 
