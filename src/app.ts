@@ -7,7 +7,7 @@ import { toAsk, httpInject } from "@builderbot-plugins/openai-assistants"
 import { typing } from "./utils/presence"
 
 // Define constant values
-const PORT = process.env.PORT ?? 3008
+const PORT = 8080
 const ASSISTANT_ID = process.env.ASSISTANT_ID ?? ''
 
 // Define interfaces for type safety
