@@ -22,9 +22,8 @@ FROM node:20-alpine as deploy
 
 WORKDIR /app
 
-ARG PORT
-ENV PORT $PORT
-EXPOSE $PORT
+ENV PORT=8080
+EXPOSE 8080
 
 COPY --from=builder /app/assets ./assets
 COPY --from=builder /app/dist ./dist
