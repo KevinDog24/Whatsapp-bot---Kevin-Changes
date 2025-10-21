@@ -345,7 +345,7 @@ const main = async () => {
         
             if (connection === 'close') {
                 const shouldReconnect = (lastDisconnect?.error)?.output?.statusCode !== 401;
-                console.error('Connection closed. Reconnecting:', shouldReconnect, 'Error:', explainErr(lastDisconnect?.error)
+                console.error('Connection closed. Reconnecting:', shouldReconnect, 'Error:', explainErr(lastDisconnect?.error));
         
                 // Custom reconnection logic for token expiry
                 if (lastDisconnect?.error?.output?.statusCode === 403) {
